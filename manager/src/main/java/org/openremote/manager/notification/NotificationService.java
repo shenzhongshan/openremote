@@ -180,6 +180,12 @@ public class NotificationService extends RouteBuilder implements ContainerServic
    * retention on a long-lived instance may therefore remove a large number of rows at once.
    */
   protected void purgeNotifications() {
+    if (maxAgeDays <= 0) {
+      // start() only schedules this when retention is configured, but guard anyway: a negative
+      // age would put the cutoff in the future and delete every notification there is
+      return;
+    }
+
     try {
       Instant cutoff = timerService.getNow().truncatedTo(DAYS).minus(maxAgeDays, DAYS);
 

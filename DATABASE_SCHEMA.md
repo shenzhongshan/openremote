@@ -467,6 +467,15 @@ Delete on notification (actual time=17.570..17.572)
 
 清理是**单条 DELETE**（与 syslog、数据点清理一致，未分批）。因此在一个长期运行的实例上**首次**启用保留时，会一次性删除大量行；如果历史量很大，建议先手工按时间分段删到目标窗口附近，再开启该配置。
 
+`purgeNotifications()` 内部有一道 `maxAgeDays <= 0` 直接返回的保护。`start()` 本来就只在配置了保留期时才排程，但少了这道保护时，若该方法被以关闭状态调用，`minus(-1, DAYS)` 会把 cutoff 推到**未来**从而删空整张表。这一点是在写测试时发现的（`AssetDatapointService.purgeDataPoints()` 同样只在排程处判断，未在方法内保护）。
+
+规格：`test/src/test/groovy/org/openremote/test/notification/NotificationPurgeTest.groovy`，两个 feature：
+
+1. 配置 30 天保留后，围绕 cutoff 插入 `-335 天`、`cutoff-1 秒`、`cutoff`、`cutoff+1 秒`、`当前` 五条记录，断言严格小于语义（正好落在 cutoff 的那条应保留），并重复调用一次确认幂等；
+2. 默认配置下断言 `maxAgeDays <= 0`，且即使直接调用 `purgeNotifications()` 也不会删除十年前的记录（即上述保护）。
+
+fixture 以 cutoff 为基准而非整天数表达，因此不受测试运行时刻的影响。清理走 `purgeNotifications()` 直接调用而非等待定时任务 —— 定时任务用的是**真实时间**的 `scheduleAtFixedRate`，推进伪时钟并不会让它触发，这与 `AssetDatapointPurgeTest` 直接调 `purgeDataPoints()` 的做法一致。
+
 ### 8.2 ALARM
 
 实体名 `SentAlarm`。
@@ -1367,6 +1376,7 @@ CREATE EXTENSION IF NOT EXISTS timescaledb_toolkit SCHEMA public cascade;
 | `manager/.../notification/NotificationService.java` | 新增 `OR_NOTIFICATION_MAX_AGE_DAYS` 与每日清理 | §8.1.1 |
 | `container/.../persistence/PersistenceService.java` | Flyway 加 `ignoreMigrationPatterns("versioned:missing")` | §19.10 |
 | `profile/deploy.yml` | 补 `OR_NOTIFICATION_MAX_AGE_DAYS` 与 `OR_SYSLOG_MAX_AGE_DAYS` 的注释说明 | §8.1.1、§12.1 |
+| `test/.../notification/NotificationPurgeTest.groovy` | 新增 Spock 规格（cutoff 边界 + 默认关闭） | §8.1.1 |
 
 未改动的观察项：19.1、19.2（结论撤回）、19.5、19.6、19.7、19.9。
 
@@ -1390,9 +1400,19 @@ CREATE EXTENSION IF NOT EXISTS timescaledb_toolkit SCHEMA public cascade;
 - `ManagerKeycloakIdentityProvider.deleteRealm()` 新增的三段 JPQL 删除，其字段名（`Dashboard.realm`、`SentAlarm.realm`、`SentNotification.realm`）与导入均已逐一核对，代码形态与同方法内既有三段完全一致，但**未经编译**；三段删除等价的 SQL 已在真实 schema 上验证（包括删除 `ALARM` 行会通过 `ALARM_ASSET_LINK` 的级联带走关联行）。
 - `PersistenceService` 的 `ignoreMigrationPatterns("versioned:missing")` 调用签名已用 `javap` 对 `flyway-core 13.10.0` 核对存在且返回 `FluentConfiguration`，但**未经编译**。
 - `NotificationService` 的清理逻辑：`getInteger` 静态导入、`container.getScheduledExecutor()`、`SentNotification.sentOn` 与 `Instant` 参数的用法均对照同文件内既有代码（`n.sentOn >= ?` 等）与 `SyslogService`/`AssetDatapointService` 的调度写法核对，等价 SQL 已在真实 schema 上验证正确性与执行计划，但**未经编译**，定时任务也**未在运行中的 Manager 上实际触发过**。
-- `spotless` 格式化未运行。
+- `NotificationPurgeTest.groovy` **已通过 Groovy 5.0.7 的 AST 转换阶段解析（语法无误）**，license header 与模板逐字节一致，但**未真正运行过** —— 跑它需要完整构建加 `profile/dev-testing.yml` 的依赖栈。其中用到的 trait 辅助方法（`defaultConfig()`、`defaultServices()`、`stopPseudoClock()`、`getClockTimeOf()`）与 `SentNotification` 的 setter、`Notification.Source.INTERNAL`、`EmailNotificationMessage.TYPE` 均已逐一核对存在。
+- `spotless` 格式化未运行；Groovy 侧用的是 `greclipse`，缩进与续行风格照 `AssetDatapointPurgeTest` 对齐，但可能仍有细微漂移需 `spotlessApply` 收敛。
 
-合并前应至少执行 `./gradlew :manager:compileJava :container:compileJava` 与 `./gradlew spotlessApply`，跑一遍 realm/user 删除相关的 Spock 集成测试，并为通知清理补一个 Spock 规格（`TimerService` 支持伪时钟，可直接做时间旅行验证清理窗口）。
+合并前应至少执行：
+
+```bash
+./gradlew :manager:compileJava :container:compileJava
+./gradlew spotlessApply
+docker compose -f profile/dev-testing.yml -p openremote up -d --no-build
+./gradlew :test:test --tests '*NotificationPurgeTest*'
+```
+
+并跑一遍 realm/user 删除相关的既有 Spock 集成测试。
 
 ---
 
