@@ -40,6 +40,7 @@
 18. [Flyway 迁移清单](#18-flyway-迁移清单)
 19. [实测验证结论](#19-实测验证结论)
 20. [验证环境与方法](#20-验证环境与方法)
+21. [已实施的修复](#21-已实施的修复)
 
 ---
 
@@ -65,7 +66,7 @@ Manager 共管理 **15 张物理表** + **4 个 Keycloak 只读视图映射**：
 | 14 | `ALARM_ASSET_LINK` | 告警 | `(ASSET_ID, REALM, SENTALARM_ID)` | `V20240813_01` | 告警 ↔ 资产关联 |
 | 15 | `flyway_schema_history` | 元数据 | — | Flyway 自建 | 迁移历史 |
 
-**命名风格**：DDL 中表名与列名写作大写（`ASSET`、`PARENT_ID`），但 PostgreSQL 未加引号的标识符会**折叠为小写**，因此实际存储的名称是 `asset`、`parent_id`。后期迁移（如 `V20240722_01`、`V20260518_01`）直接使用小写形式，两者等价。
+**命名风格**：DDL 中表名与列名写作大写（`ASSET`、`PARENT_ID`），但 PostgreSQL 未加引号的标识符会**折叠为小写**，因此实际存储的名称是 `asset`、`parent_id`。后期迁移（如 `V20251022_01`、`V20260518_01`）直接使用小写形式，两者等价。
 
 ---
 
@@ -751,16 +752,21 @@ END IF;
 |---|---|---|---|
 | `SECTION_PARENT_PATH_IDX` | `ASSET` | `USING GIST (path)` | `V20191202_01` |
 | `SECTION_PARENT_ID_IDX` | `ASSET` | `(parent_id)` | `V20191202_01` |
-| `asset_datapoint_entity_id_attribute_name_timestamp_idx` | `ASSET_DATAPOINT` | `(entity_id, attribute_name, timestamp DESC)` | `V20240722_01`，`V20251022_01` 重建 |
-| `asset_predicted_datapoint_entity_id_attribute_name_timestamp_idx` | `ASSET_PREDICTED_DATAPOINT` | `(entity_id, attribute_name, timestamp DESC)` | 同上 |
+| `asset_datapoint_entity_id_attribute_name_timestamp_idx` | `ASSET_DATAPOINT` | `(entity_id, attribute_name, timestamp DESC)` | `V20251022_01` |
+| `asset_predicted_datapoint_entity_id_attribute_name_timestamp_idx` | `ASSET_PREDICTED_DATAPOINT` | `(entity_id, attribute_name, timestamp DESC)` | 同上（名称超 63 字符，实际被截断为 `..._timestamp_id`） |
+| `ALARM_REALM_STATUS_CREATED_ON_IDX` | `ALARM` | `(REALM, STATUS, CREATED_ON DESC)` | `V20261017_0225` |
+| `NOTIFICATION_REALM_SENT_ON_IDX` | `NOTIFICATION` | `(REALM, SENT_ON DESC)` | `V20261017_0225` |
+| `SYSLOG_EVENT_CATEGORY_TIMESTAMP_IDX` | `SYSLOG_EVENT` | `(CATEGORY, TIMESTAMP DESC)` | `V20261017_0225` |
+| `SYSLOG_EVENT_TIMESTAMP_IDX` | `SYSLOG_EVENT` | `(TIMESTAMP DESC)` | `V20261017_0225` |
+| `ASSET_REALM_IDX` | `ASSET` | `(REALM)` | `V20261017_0225` |
 
 GiST 索引是 ltree 子树查询（`<@`、`@>`）走索引的前提，直接决定 `AssetQuery.recursive` 的性能。
 
 数据点索引的列序 `(entity_id, attribute_name, timestamp DESC)` 精准匹配最常见的访问模式："某资产某属性的最近 N 个值 / 某时间范围的值"。`DESC` 让"最新值"成为索引首项。
 
-### V20251022_01 的 schema 名参数化
+### schema 名参数化
 
-`V20240722_01` 把 schema 名 `openremote` **硬编码**在索引 DDL 里。`V20251022_01__UpdateIndexesSchemaName.sql` 先 `DROP INDEX IF EXISTS openremote.<name>` 再用 Flyway 占位符 `${schemaName}` 重建，使自定义 `OR_DB_SCHEMA` 的部署也能正确建索引。
+早期的 `V20240722_01__Indexes.sql` 把 schema 名 `openremote` **硬编码**在索引 DDL 里，导致自定义 `OR_DB_SCHEMA` 的全新部署启动失败（见 §19.10），该脚本已被删除。`V20251022_01__UpdateIndexesSchemaName.sql` 先 `DROP INDEX IF EXISTS openremote.<name>` 清掉存量部署里的旧索引，再用 Flyway 占位符 `${schemaName}` 重建，因此两类部署的索引都由它负责。
 
 占位符由 `PersistenceService` 注入：
 
@@ -850,14 +856,13 @@ TimescaleDB 另为 hypertable 的每个 chunk 维护时间维索引。
 | `V20230120_01` | `Timescale` | DDL | 两张数据点表转 hypertable |
 | `V20240508_01` | `Gateways` | 数据 | 给 `GatewayAsset` 加 `tunnelingSupported` 属性 |
 | `V20240711_01` | `UpdateGatewayConnection` | DDL | `GATEWAY_CONNECTION` 加 `ATTRIBUTE_FILTERS jsonb` |
-| `V20240722_01` | `Indexes` | 索引 | 两张数据点表的复合索引（schema 名硬编码） |
 | `V20240813_01` | `Alarms` | DDL | 建 `ALARM`、`ALARM_ASSET_LINK` + 4 个外键 |
 | `V20241210_01` | `ImproveAssetPath` | 函数+数据 | 重写路径触发器（后代级联 + 环检测）、加 `array_reverse`、重算全部 `PATH` |
 | `V20250217_01` | `KeepExistingWidgetConfig` | 数据 | 仪表盘 map/table 组件补 `allOfType` |
 | `V20250218_01` | `UpdateGatewayConnection` | DDL | `GATEWAY_CONNECTION` 加 `SYNC_RULES jsonb` |
 | `V20250422_01` | `DashboardAccess` | DDL | 删 `EDIT_ACCESS`，`VIEW_ACCESS` → `ACCESS` |
 | `V20250617_01` | `GatewayWidgetRefs` | 数据 | gateway 组件 `gatewayId` → `attributeRefs[]` |
-| `V20251022_01` | `UpdateIndexesSchemaName` | 索引 | 用 `${schemaName}` 重建数据点索引 |
+| `V20251022_01` | `UpdateIndexesSchemaName` | 索引 | 用 `${schemaName}` 建数据点索引（取代已删除的 `V20240722_01`） |
 | `V20260120_01` | `addTableFunc` | 扩展 | `CREATE EXTENSION tablefunc` |
 | `V20260302_01` | `RequireSimulatorSchedule` | 数据 | 给缺 schedule 的 `SimulatorAgentLink` 补每日调度（含两段验证用注释 SQL） |
 | `V20260506_01` | `DatapointMetricQuery` | 函数 | `datapoint_metric_query()` 指标函数 |
@@ -865,6 +870,9 @@ TimescaleDB 另为 hypertable 的每个 chunk 维护时间维索引。
 | `V20260518_01` | `AssetFillFactor` | DDL | `asset` 表 `fillfactor = 90` |
 | `V20260715_1443` | `AddNotificationRealm` | DDL+数据 | `NOTIFICATION` 加 `realm` 并部分回填 |
 | `V20260923_1100` | `AssetDeletePending` | DDL | `asset` 加 `delete_pending boolean NOT NULL DEFAULT false` |
+| `V20261017_0215` | `AlarmAssigneeSetNull` | DDL | `ALARM.ASSIGNEE_ID` 外键改为 `ON DELETE SET NULL`（修复 §19.3） |
+| `V20261017_0220` | `RealmScopedForeignKeys` | DDL | `DASHBOARD`/`ALARM`/`NOTIFICATION`/`GATEWAY_CONNECTION.LOCAL_REALM` 补 realm 外键，`NOT VALID`（修复 §19.4） |
+| `V20261017_0225` | `GrowthTableIndexes` | 索引 | 增长型表的二级索引（修复 §19.8） |
 
 ### Java 迁移（`manager/setup/database/`）
 
@@ -886,18 +894,20 @@ Java 迁移处理 SQL 做不到的事 —— 主要是需要调 **Keycloak Admin
 
 ### 结论总览
 
-| # | 观察项 | 实测结论 | 建议 |
+| # | 观察项 | 实测结论 | 处理状态 |
 |---|---|---|---|
-| 19.1 | `ConsoleAppConfig` 被注册为实体 | 运行期无害，仅为残留 | 低 · 清理 |
-| 19.2 | 预测数据点表缺外键 | **不是问题**（原结论有误） | 无需处理 |
-| 19.3 | `ALARM.ASSIGNEE_ID` CASCADE | **确认数据丢失**，比原结论更严重 | 高 · 修复 |
-| 19.4 | 多个 `REALM` 列缺外键 | **确认跨租户数据泄露路径** | **最高** · 修复 |
-| 19.5 | JPA 与 DDL 列长度不一致 | 运行期无害，仅元数据误导 | 低 · 清理 |
-| 19.6 | 两处 `@Enumerated(ORDINAL)` | 确认无任何数据库层防护 | 中 · 加防护 |
-| 19.7 | `port` 上界 65536 | 确认（代码层，off-by-one） | 低 · 修复 |
-| 19.8 | 增长型表缺二级索引 | **确认，实测 100–450 倍差距** | 中高 · 加索引 |
+| 19.1 | `ConsoleAppConfig` 被注册为实体 | 运行期无害，仅为残留 | 未处理（低） |
+| 19.2 | 预测数据点表缺外键 | **不是问题**（原结论有误） | 结论撤回 |
+| 19.3 | `ALARM.ASSIGNEE_ID` CASCADE | **确认数据丢失**，比原结论更严重 | ✅ **已修复并实测验证** |
+| 19.4 | 多个 `REALM` 列缺外键 | **确认跨租户数据泄露路径** | ✅ **已修复并实测验证** |
+| 19.5 | JPA 与 DDL 列长度不一致 | 运行期无害，仅元数据误导 | 未处理（低） |
+| 19.6 | 两处 `@Enumerated(ORDINAL)` | 确认无任何数据库层防护 | 未处理（中） |
+| 19.7 | `port` 上界 65536 | 确认（代码层，off-by-one） | 未处理（低） |
+| 19.8 | 增长型表缺二级索引 | **确认，实测 100–450 倍差距** | ✅ **已修复并实测验证** |
 | 19.9 | 与 Keycloak 内部 schema 耦合 | 确认在 Keycloak 26 上成立，属设计约束 | 记录在案 |
-| **19.10** | **（新发现）自定义 schema 部署启动失败** | **确认，一行修复** | **高** · 修复 |
+| **19.10** | **（新发现）自定义 schema 部署启动失败** | **确认（真实 Flyway 复现）** | ✅ **已修复，带取舍** |
+
+已修复项的改动清单见[第 21 节](#21-已实施的修复)。
 
 ---
 
@@ -982,14 +992,17 @@ after  user delete|      1 |                 0     ← 告警与其资产关联�
 
 **为什么该处理**：`ASSIGNEE_ID` 本身可空，`ON DELETE SET NULL` 在语义上完全可行且是常规做法；员工离职清理账号是常见运维动作，而告警通常被当作审计记录。
 
-**建议**：改为 `ON DELETE SET NULL`。
+**已修复** —— `V20261017_0215__AlarmAssigneeSetNull.sql` 把外键改为 `ON DELETE SET NULL`。重跑同一场景：
 
-```sql
-ALTER TABLE ${schemaName}.alarm DROP CONSTRAINT alarm_assignee_id_fkey;
-ALTER TABLE ${schemaName}.alarm
-  ADD CONSTRAINT alarm_assignee_id_fkey FOREIGN KEY (assignee_id)
-  REFERENCES PUBLIC.USER_ENTITY (ID) ON DELETE SET NULL;
 ```
+DELETE user via Keycloak admin API -> 204
+       phase       | alarms | alarm_asset_links
+AFTER user delete  |      1 |                 1
+     title      | source_id |   assignee
+Assigned alarm  | m-1       | (unassigned)
+```
+
+告警与资产关联均存活，仅指派被清空。
 
 ---
 
@@ -1063,10 +1076,28 @@ Tenant A private dashboard |      2 | hidden
 
 **风险定性**：这是**跨租户数据泄露**，而非单纯的存储浪费。触发条件是「删除 realm 后以同名重建」——在按客户名命名 realm 的 SaaS 部署里，客户流失后同名重新签约并不罕见；测试/演示环境反复建删同名 realm 更常见。
 
-**建议**（两者都做）：
+**已修复（两头都做）**：
 
-1. `deleteRealm` 补上 `Dashboard`、`SentAlarm`、`SentNotification` 的删除，与既有三张表一致；
-2. 给这三张表加上 realm 外键作为兜底（需先清理既有孤儿行）。只做 1 不做 2，直接在 Keycloak 控制台删 realm 仍会绕过清理。
+1. `ManagerKeycloakIdentityProvider.deleteRealm()` 补上 `Dashboard`、`SentAlarm`、`SentNotification` 的删除，与既有三张表一致；
+2. `V20261017_0220__RealmScopedForeignKeys.sql` 给这三张表加上 realm 外键（`ON DELETE CASCADE`），外加 `GATEWAY_CONNECTION.LOCAL_REALM`，作为绕过应用层（如直接在 Keycloak 控制台删 realm）时的兜底。
+
+外键用 `NOT VALID` 创建，这一点是刻意的：**升级不会删除任何既有数据**，但新的 realm 删除会正确级联。实测三项性质：
+
+```
+A. 含孤儿行的库执行该迁移 -> ALTER TABLE 成功，孤儿行保留（升级非破坏性）
+B. 新插入引用不存在 realm 的行 -> ERROR: violates foreign key constraint "alarm_realm_fkey"
+C. 插入引用既有 realm 的行 -> 正常
+```
+
+重跑泄露场景（直接从 Keycloak 删 realm，再同名重建）：
+
+```
+DELETE realm -> 204 ; re-create realm tenantx (tenant B) -> 201
+         phase         | dash | alarms | notifs | gw
+ what tenant B can see |    0 |      0 |      0 |  0
+```
+
+**迁移前就已存在的孤儿行不会被删除**，因此仍可能在名称复用时重现。迁移脚本的注释里给出了统计与清理 SQL，以及随后 `VALIDATE CONSTRAINT` 的命令，供运维按自己的节奏执行。
 
 ---
 
@@ -1138,7 +1169,16 @@ CREATE INDEX ON asset (realm);
 - 「无 category 过滤、只看最新日志」这一最常见入口仍是 Seq Scan（36 ms），需要再加一个 `syslog_event (timestamp DESC)`；
 - 绝对耗时看似不大（几十毫秒），但这是 50 万行的热缓存结果。Seq Scan 成本随行数**线性增长**而索引基本持平，且 `NOTIFICATION` 与 `SYSLOG_EVENT` **没有任何自动清理机制**（不像数据点表有 `drop_chunks` 保留策略），长期运行的实例会单调累积。
 
-**建议**：按上表加索引，并为这两张表安排归档或保留策略。
+**已修复** —— `V20261017_0225__GrowthTableIndexes.sql` 按上述形状建立索引（含补上的 `SYSLOG_EVENT (TIMESTAMP DESC)`）。在装载数据的库上确认执行计划全部命中新索引：
+
+```
+alarms realm+status        -> Index Scan using alarm_realm_status_created_on_idx     0.105 ms
+notifications realm newest -> Index Scan using notification_realm_sent_on_idx        0.100 ms
+syslog category newest     -> Index Scan using syslog_event_category_timestamp_idx   0.130 ms
+syslog no category filter  -> Index Scan using syslog_event_timestamp_idx            0.072 ms
+```
+
+`NOTIFICATION` 与 `SYSLOG_EVENT` 的归档/保留策略**仍未解决**——索引只改善读取，不阻止表无限增长。
 
 ---
 
@@ -1185,7 +1225,40 @@ FAIL V20240722_01__Indexes.sql  <-- ERROR:  schema "openremote" does not exist
 
 `OR_DB_SCHEMA` 是文档化的部署参数（`profile/deploy.yml:244`：`OR_DB_SCHEMA: ${OR_DB_SCHEMA:-openremote}`），因此该场景是可达的。
 
-**修复**：把这两行的 `openremote.` 换成 `${schemaName}.`。由于 V20240722_01 已在存量部署中标记为已应用，修改其内容会触发 Flyway 校验和失败，因此**不要改动该文件**，而应新增一个迁移脚本用 `${schemaName}` 创建这两个索引（`IF NOT EXISTS` 对存量部署天然幂等），或将 V20240722_01 的两条语句改为对 schema 存在性做容错。推荐前者。
+**真实 Flyway 复现**（不只是手工 psql 回放）。在一个干净数据库上以 `OR_DB_SCHEMA=ormgr` 跑官方 Flyway CLI：
+
+```
+Migrating schema "ormgr" to version "20240722.01 - Indexes"
+ERROR: Migration of schema "ormgr" to version "20240722.01 - Indexes" failed!
+Message : ERROR: schema "openremote" does not exist
+```
+
+**为什么不能直接改这个文件** —— 实测确认改内容会让存量部署的校验失败：
+
+```
+ERROR: Validate failed: Migrations have failed validation
+Migration checksum mismatch for migration version 20240722.01
+-> Applied to database : 1206920529
+-> Resolved locally    : -1978754822
+```
+
+`PersistenceService` 在 `migrate()` 后显式调用 `flyway.validate()`，所以这会让每个存量部署在下次重启时启动失败。
+
+**已采用的修复**：删除 `V20240722_01__Indexes.sql`，并在 Flyway 配置中加 `ignoreMigrationPatterns("versioned:missing")`。
+
+- 删除是安全的：这两个索引由 `V20251022_01` 用 `${schemaName}` 先 DROP 再 CREATE，功能完全被取代（实测两种 schema 下索引数均为 2）；
+- 存量部署会把它报成「已应用但本地已不存在」，正是该 pattern 容忍的状态。
+
+实测结果：
+
+```
+全新 + 自定义 schema : Successfully applied 25 migrations to schema "ormgr"
+存量 + 默认 schema   : Successfully validated 27 migrations
+```
+
+**这个修复有代价，必须记录**：Flyway 的 pattern type 只接受 `*`、`repeatable`、`versioned` 三种，**无法把忽略范围缩小到单个版本**（实测传 `20240722.01:missing` 报 `Invalid migration type`）。因此 `versioned:missing` 也会让**今后任何**「已应用但脚本丢失」的情况不再报错，失去一道防误删保护。已在 `PersistenceService` 的该行上方注释说明原委，便于后续复查。
+
+（`flyway-core 13.10.0` 的 `FluentConfiguration.ignoreMigrationPatterns(String...)` 与 `ValidatePattern` 接受的三种 type 均经 `javap` 核对，与测试所用 CLI 11.20.3 一致。）
 
 ---
 
@@ -1225,5 +1298,44 @@ CREATE EXTENSION IF NOT EXISTS timescaledb_toolkit SCHEMA public cascade;
 | 19.1 / 19.5 / 19.7 | 代码层确认（19.1 另有「产品正常发布运行」作为运行期无害的反证） |
 
 **未能在本环境完成的验证**：启动完整 Manager 进程（`./gradlew :manager:run`）。构建先遇 Maven Central 429 限流，继而因沙箱无法访问 `jitpack.io`（`GradleFileEncrypt` 插件来源）而无法完成依赖解析。因此 19.1 的运行期结论依据的是注册机制分析加产品发布事实，而非本地启动日志；19.10 的启动失败结论依据的是迁移实测失败加 Flyway/Container/Main 的异常传播路径代码确认。其余各条均为直接实测。
+
+## 21. 已实施的修复
+
+### 改动清单
+
+| 文件 | 性质 | 对应 |
+|---|---|---|
+| `manager/.../database/V20261017_0215__AlarmAssigneeSetNull.sql` | 新增 | §19.3 |
+| `manager/.../database/V20261017_0220__RealmScopedForeignKeys.sql` | 新增 | §19.4 |
+| `manager/.../database/V20261017_0225__GrowthTableIndexes.sql` | 新增 | §19.8 |
+| `manager/.../database/V20240722_01__Indexes.sql` | **删除** | §19.10 |
+| `manager/.../security/ManagerKeycloakIdentityProvider.java` | `deleteRealm()` 补三张表的清理 | §19.4 |
+| `container/.../persistence/PersistenceService.java` | Flyway 加 `ignoreMigrationPatterns("versioned:missing")` | §19.10 |
+
+未改动的观察项：19.1、19.2（结论撤回）、19.5、19.6、19.7、19.9。
+
+### 验证方式
+
+迁移全部通过**官方 Flyway CLI**（`flyway/flyway:11-alpine`）应用，而非手工 psql 回放，占位符与 `-placeholders.schemaName` 一致：
+
+| 场景 | 结果 |
+|---|---|
+| 全新部署，默认 schema `openremote` | `Successfully applied 26 migrations`，随后 `validate` 通过 |
+| 全新部署，自定义 schema `ormgr` | `Successfully applied 25 migrations`（修复前卡在 `V20240722_01`） |
+| 存量部署，默认 schema | `Successfully validated 27 migrations` |
+
+行为层面逐条复跑了修复前失败的场景（删用户、删 realm、realm 名复用、各查询执行计划），结果见 §19.3 / §19.4 / §19.8。新建的约束与索引经 `pg_constraint` / `pg_stat_user_indexes` 核对到位，realm 外键的 `convalidated = f` 确认为 `NOT VALID`。
+
+### 尚未验证的部分
+
+**Java 侧改动未经编译或运行**。本环境无法完成 Gradle 构建：依赖解析先遇 Maven Central 429 限流，继而因沙箱无法访问 `jitpack.io`（`GradleFileEncrypt` 插件来源）而失败。因此：
+
+- `ManagerKeycloakIdentityProvider.deleteRealm()` 新增的三段 JPQL 删除，其字段名（`Dashboard.realm`、`SentAlarm.realm`、`SentNotification.realm`）与导入均已逐一核对，代码形态与同方法内既有三段完全一致，但**未经编译**；三段删除等价的 SQL 已在真实 schema 上验证（包括删除 `ALARM` 行会通过 `ALARM_ASSET_LINK` 的级联带走关联行）。
+- `PersistenceService` 的 `ignoreMigrationPatterns("versioned:missing")` 调用签名已用 `javap` 对 `flyway-core 13.10.0` 核对存在且返回 `FluentConfiguration`，但**未经编译**。
+- `spotless` 格式化未运行。
+
+合并前应至少执行 `./gradlew :manager:compileJava :container:compileJava` 与 `./gradlew spotlessApply`，并跑一遍 realm/user 删除相关的 Spock 集成测试。
+
+---
 
 *文档生成于 2026-10-17，基于 `mydev` 分支 HEAD `8f8a5d2`。*

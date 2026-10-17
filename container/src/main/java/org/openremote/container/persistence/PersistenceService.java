@@ -632,6 +632,18 @@ public class PersistenceService implements ContainerService, Consumer<Persistenc
             .initSql(initSql.toString())
             .baselineOnMigrate(true)
             .outOfOrder(outOfOrder)
+            // V20240722_01__Indexes.sql hardcoded the schema name, so it failed with
+            // 'schema "openremote" does not exist' on a fresh install using any other
+            // OR_DB_SCHEMA, which aborted migration and stopped the container from starting. Its
+            // two indexes are dropped and recreated against ${schemaName} by
+            // V20251022_01__UpdateIndexesSchemaName.sql, so the script was removed rather than
+            // edited: changing an applied migration's contents fails checksum validation on every
+            // existing deployment. Removing it instead leaves those deployments reporting it as
+            // applied but no longer resolvable locally, which this pattern tolerates. The narrowest
+            // pattern Flyway accepts here is 'versioned', as the type only takes '*', 'repeatable'
+            // or 'versioned' - so this also stops a genuinely lost migration script from being
+            // reported.
+            .ignoreMigrationPatterns("versioned:missing")
             .placeholders(Map.of("schemaName", schemaName))
             .load();
 

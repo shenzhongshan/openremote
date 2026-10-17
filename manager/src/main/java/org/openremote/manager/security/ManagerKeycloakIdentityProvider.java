@@ -66,9 +66,12 @@ import org.openremote.manager.event.ClientEventService;
 import org.openremote.model.Constants;
 import org.openremote.model.Container;
 import org.openremote.model.PersistenceEvent;
+import org.openremote.model.alarm.SentAlarm;
 import org.openremote.model.auth.OAuthGrant;
 import org.openremote.model.auth.OAuthPasswordGrant;
+import org.openremote.model.dashboard.Dashboard;
 import org.openremote.model.gateway.GatewayConnection;
+import org.openremote.model.notification.SentNotification;
 import org.openremote.model.provisioning.ProvisioningConfig;
 import org.openremote.model.query.AssetQuery;
 import org.openremote.model.query.UserQuery;
@@ -1235,6 +1238,36 @@ public class ManagerKeycloakIdentityProvider extends KeycloakIdentityProvider
                       + RealmRuleset.class.getSimpleName()
                       + " rs "
                       + "where rs.realm = ?1");
+          query.setParameter(1, realmName);
+          query.executeUpdate();
+
+          // Delete dashboards
+          query =
+              entityManager.createQuery(
+                  "delete from "
+                      + Dashboard.class.getSimpleName()
+                      + " d "
+                      + "where d.realm = ?1");
+          query.setParameter(1, realmName);
+          query.executeUpdate();
+
+          // Delete alarms; the ALARM_ASSET_LINK rows go with them through the DB cascade
+          query =
+              entityManager.createQuery(
+                  "delete from "
+                      + SentAlarm.class.getSimpleName()
+                      + " sa "
+                      + "where sa.realm = ?1");
+          query.setParameter(1, realmName);
+          query.executeUpdate();
+
+          // Delete notifications
+          query =
+              entityManager.createQuery(
+                  "delete from "
+                      + SentNotification.class.getSimpleName()
+                      + " sn "
+                      + "where sn.realm = ?1");
           query.setParameter(1, realmName);
           query.executeUpdate();
         });
