@@ -38,7 +38,8 @@
 16. [索引清单](#16-索引清单)
 17. [外键与级联行为](#17-外键与级联行为)
 18. [Flyway 迁移清单](#18-flyway-迁移清单)
-19. [已发现的问题](#19-已发现的问题)
+19. [实测验证结论](#19-实测验证结论)
+20. [验证环境与方法](#20-验证环境与方法)
 
 ---
 
@@ -138,7 +139,7 @@ protected Long id;
 3. **资产模型中的资产子类**：`UnknownAsset` 显式加入（它没有 asset descriptor），其余从 `ValueUtil.getAssetDescriptors(null)` 取出并**过滤出带 `@Entity` 的类**；
 4. **`EntityClassProvider` SPI**：`ServiceLoader` 发现，同样过滤 `@Entity`。
 
-> **注意**：第 1 批（硬编码清单）**不做 `@Entity` 过滤**，而第 3、4 批做。这导致 `ConsoleAppConfig` 这个纯 POJO 被注册进实体列表 —— 详见[第 19 节](#19-已发现的问题)。
+> **注意**：第 1 批（硬编码清单）**不做 `@Entity` 过滤**，而第 3、4 批做。这导致 `ConsoleAppConfig` 这个纯 POJO 被注册进实体列表 —— 详见[第 19 节](#19-实测验证结论)。
 
 `model/flow` 下的 `Flow`、`Node`、`Slot`、`Wire` 虽带 `@Entity`/`@Table`，但**不在任何一批注册名单中**，也没有任何迁移脚本创建对应表 —— 它们是遗留代码，不构成运行时 schema。
 
@@ -879,83 +880,350 @@ Java 迁移处理 SQL 做不到的事 —— 主要是需要调 **Keycloak Admin
 
 ---
 
-## 19. 已发现的问题
+## 19. 实测验证结论
 
-静态分析中发现的不一致与风险点，按严重度排序。均为**观察结论**，是否需要处理取决于实际部署场景。
+本节的每一条都在**真实依赖栈**上验证过，而非静态推断。验证环境与方法记录在[第 20 节](#20-验证环境与方法)。
 
-### 19.1 `ConsoleAppConfig` 被注册为实体，但它不是实体
+### 结论总览
 
-`PersistenceService.start():385` 把 `ConsoleAppConfig.class.getName()` 加入实体清单，但 `model/src/main/java/org/openremote/model/apps/ConsoleAppConfig.java` **没有任何 `jakarta.persistence` 注解**（该文件对 `jakarta.persistence` 的 import 数为 0），字段只有 `@JsonProperty`，也没有任何迁移脚本创建对应表。
-
-同方法中第 3、4 批注册都做了 `.filter(c -> c.getAnnotation(Entity.class) != null)`，唯独第 1 批硬编码清单不过滤。这是一处残留：该类应从清单移除，或给第 1 批也加上同样的过滤。
-
-### 19.2 `ASSET_PREDICTED_DATAPOINT` 缺少指向 `ASSET` 的外键
-
-`ASSET_DATAPOINT.ENTITY_ID` 有 `FK → ASSET(ID) ON DELETE CASCADE`，而 `ASSET_PREDICTED_DATAPOINT` 没有任何外键。后果：**删除资产后其预测数据点成为孤儿行**，既不会被清理，也不会被任何查询命中（无资产可引用），只是持续占用存储和 hypertable chunk。
-
-两张表同为数据点、同一基类、同为 hypertable，这个差异看不出设计意图。
-
-### 19.3 `ALARM.ASSIGNEE_ID` 的 CASCADE 会删除告警
-
-```sql
-alter table ALARM add foreign key (ASSIGNEE_ID) references PUBLIC.USER_ENTITY (ID) on delete cascade;
-```
-
-删除一个 Keycloak 用户会**连带删除所有指派给该用户的告警行**，而不是把 `ASSIGNEE_ID` 置为 NULL。`ASSIGNEE_ID` 本身可空，所以 `ON DELETE SET NULL` 在语义上是可行的。如果告警被当作运维审计记录使用，员工离职清理账号会静默丢失历史。
-
-### 19.4 多个 `REALM` 列缺少外键约束
-
-有外键的：`ASSET`、`REALM_RULESET`、`PROVISIONING_CONFIG`、`USER_ASSET_LINK`、`ALARM_ASSET_LINK`。
-没有外键的：`ALARM.REALM`、`DASHBOARD.REALM`、`NOTIFICATION.REALM`、`GATEWAY_CONNECTION.REALM` 与 `LOCAL_REALM`。
-
-同一个概念（租户归属）在不同表上保护强度不同。注意 `ALARM_ASSET_LINK.REALM` 有外键而 `ALARM.REALM` 没有 —— 同一特性的两张表就不一致。
-
-### 19.5 JPA 与 DDL 的列长度不一致
-
-| 表.列 | DDL | JPA `@Column(length)` |
-|---|---|---|
-| `USER_ASSET_LINK.REALM` | `varchar(255)` | `36` |
-| `ALARM_ASSET_LINK.REALM` | `varchar(255)` | `36` |
-| `ASSET_PREDICTED_DATAPOINT.ENTITY_ID` | `varchar(36)` | `36`（基类 `Datapoint`） |
-| `ASSET_DATAPOINT.ENTITY_ID` | `varchar(22)` | `36`（同一基类） |
-
-因为 schema 由 Flyway 管理而非 `hbm2ddl` 生成，`length` 不影响实际 DDL，但它**参与 Hibernate 的校验与元数据**，且会误导读代码的人。`realm` 名在 `ASSET` 表中按 255 定义，`length = 36` 显然是误抄了 UUID 长度。
-
-### 19.6 两处 `@Enumerated(ORDINAL)` 使枚举顺序成为数据契约
-
-| 字段 | 枚举 | 存储 |
-|---|---|---|
-| `DASHBOARD.ACCESS` | `DashboardAccess` | `int8`（无 `@Enumerated` 注解 → JPA 默认 ORDINAL） |
-| `SYSLOG_EVENT.LEVEL` | `SyslogLevel` | `int4`（显式 `@Enumerated(EnumType.ORDINAL)`） |
-
-在枚举中间插入常量或重新排序，会**静默改变所有既有行的含义**，且没有任何报错。`SyslogLevel` 用序数有明确收益（`INFO=0 < WARN=1 < ERROR=2` 单调递增，可以 `WHERE level >= 1` 做范围过滤，`LevelCategoryFilter` 正依赖此）；`DashboardAccess` 则看不出必须用序数的理由，且它是**隐式**的（没写 `@Enumerated`，靠 JPA 默认值），比显式写出来更容易被忽视。
-
-对比：同为枚举的 `ALARM.SEVERITY`/`STATUS`/`SOURCE`、`NOTIFICATION.TARGET`/`SOURCE`、`RULES_LANG`、`SYSLOG_EVENT.CATEGORY` 都用 `@Enumerated(STRING)`。
-
-### 19.7 `GatewayConnection.port` 的上界是 65536
-
-```java
-@Min(value = 1) @Max(value = 65536) @Column(name = "PORT")
-protected Integer port;
-```
-
-TCP 端口的有效范围是 1–65535。`65536` 会通过校验但不是合法端口。
-
-### 19.8 增长型表缺少二级索引
-
-`NOTIFICATION`、`SYSLOG_EVENT`、`ALARM` 三张表只有主键索引，而它们都是**持续追加**且 UI 会按 realm / 状态 / 时间范围过滤查询的。`ASSET.REALM` 同样无索引，多租户部署中列租户资产会扫全表。`ASSET.ATTRIBUTES` 无 GIN 索引，按属性值过滤资产亦然。
-
-`SYSLOG_EVENT` 与 `NOTIFICATION` 的增长没有自动清理机制（不像数据点表有 `drop_chunks` 保留策略），长期运行的实例需要自行安排归档。
-
-### 19.9 与 Keycloak 内部 schema 的紧耦合
-
-5 个 `@Subselect` 实体直接 `select * from PUBLIC.<KeycloakTable>`，另有 7 个外键指向 `PUBLIC.REALM` / `PUBLIC.USER_ENTITY`，并有 3 处 `@Formula` 内联查询 `PUBLIC.REALM`、`PUBLIC.CLIENT`、`REALM_ATTRIBUTE`。
-
-Keycloak 的数据库 schema **不是公开契约**，不受其版本兼容承诺保护。这带来两个约束：
-
-1. Keycloak 大版本升级可能因内部表结构调整而破坏这些映射；
-2. Manager 与 Keycloak **无法分库部署** —— 跨 schema 外键要求两者在同一数据库实例内。
+| # | 观察项 | 实测结论 | 建议 |
+|---|---|---|---|
+| 19.1 | `ConsoleAppConfig` 被注册为实体 | 运行期无害，仅为残留 | 低 · 清理 |
+| 19.2 | 预测数据点表缺外键 | **不是问题**（原结论有误） | 无需处理 |
+| 19.3 | `ALARM.ASSIGNEE_ID` CASCADE | **确认数据丢失**，比原结论更严重 | 高 · 修复 |
+| 19.4 | 多个 `REALM` 列缺外键 | **确认跨租户数据泄露路径** | **最高** · 修复 |
+| 19.5 | JPA 与 DDL 列长度不一致 | 运行期无害，仅元数据误导 | 低 · 清理 |
+| 19.6 | 两处 `@Enumerated(ORDINAL)` | 确认无任何数据库层防护 | 中 · 加防护 |
+| 19.7 | `port` 上界 65536 | 确认（代码层，off-by-one） | 低 · 修复 |
+| 19.8 | 增长型表缺二级索引 | **确认，实测 100–450 倍差距** | 中高 · 加索引 |
+| 19.9 | 与 Keycloak 内部 schema 耦合 | 确认在 Keycloak 26 上成立，属设计约束 | 记录在案 |
+| **19.10** | **（新发现）自定义 schema 部署启动失败** | **确认，一行修复** | **高** · 修复 |
 
 ---
+
+### 19.1 `ConsoleAppConfig` 注册为实体 —— 运行期无害
+
+**事实**：该类无任何 `jakarta.persistence` 注解（`import` 计数为 0），却在 `PersistenceService.start():385` 被加入实体清单。
+
+**机制**：类名最终进入项目自定义的 `PersistenceUnitInfo.getManagedClassNames()`（`PersistenceService.java:165`），交给 `EntityManagerFactoryBuilderImpl` 处理。无映射注解的类不会被注册为映射类型。
+
+**运行期影响为零**，依据是 OpenRemote 作为发布产品持续运行（官方 `latest` 镜像与在线 demo），若此注册致命则 Manager 根本无法启动。
+
+真正的不一致在于**四批注册中只有两批过滤**：
+
+| 批次 | 来源 | `@Entity` 过滤 |
+|---|---|---|
+| 1 | 硬编码清单（20 项） | ❌ 无 |
+| 2 | `package-info` 包 | — |
+| 3 | 资产描述符 | ✅ `PersistenceService.java:408` |
+| 4 | `EntityClassProvider` SPI | ✅ `PersistenceService.java:418` |
+
+**建议**：把 `ConsoleAppConfig` 从清单移除，或给第 1 批补上同样的过滤。属整洁性清理，无功能收益。
+
+---
+
+### 19.2 预测数据点表缺外键 —— 原结论有误，实际不构成问题
+
+原文称孤儿行会「持续占用存储和 hypertable chunk」。**这是错的**，因为漏看了时间驱动的清理机制。
+
+**实测**：删除资产后，历史数据点随外键级联清除，预测数据点确实成为孤儿：
+
+```
+phase         | historical | predicted
+before delete |          1 |         1
+after delete  |          0 |         1     ← 孤儿
+```
+
+**但** `AssetPredictedDatapointService.purgeDatapoints()` 的清理条件与资产无关，只看时间：
+
+```java
+doPurge("where dp.timestamp < :dt", Date.from(timerService.getNow().truncatedTo(HOURS)));
+```
+
+预测数据点本质是**未来时间戳**的预报值，一旦预报时刻过去就会被每日清理任务删除。实测复现该清理逻辑：
+
+```
+after adding future orphan        | 2
+after daily purge run             | 2   ← 当前小时内的行因 truncatedTo(HOURS) 暂留
+after next purge (horizon passed) | 0   ← 孤儿被清除
+```
+
+清理任务由 `AbstractDatapointService.getFirstPurgeMillis` 排在每日约 3:00（预测表提前半小时，即约 2:30）执行。
+
+旁证：`V20260506_02` 只给 `asset_datapoint` 开启列存压缩，预测表没有——
+
+```
+hypertable_name           | compression_enabled
+asset_datapoint           | t
+asset_predicted_datapoint | f
+```
+
+这与"预测数据短命、无需压缩"的设计一致，也印证孤儿不会长期堆积。
+
+**结论**：孤儿存续时间上界 = 预报时刻 + 一个清理周期，而非无限。**无需处理**，原观察应撤回。
+
+---
+
+### 19.3 `ALARM.ASSIGNEE_ID` 级联 —— 确认数据丢失，且范围比原结论更大
+
+**实测**：通过 Keycloak 管理 API 删除用户（即 Manager「删除用户」按钮背后的同一条路径）：
+
+```
+DELETE user via Keycloak admin API -> HTTP 204
+
+                  | alarms | alarm_asset_links
+before user delete|      2 |                 1
+after  user delete|      1 |                 0     ← 告警与其资产关联一并消失
+```
+
+未指派的告警存活，指派给该用户的告警连同 `ALARM_ASSET_LINK` 行**一起消失**（后者由 `ALARM` 的级联二次触发）。原结论只提到告警本身，实际连资产关联也丢。
+
+**无任何应用层防护**：`UserResourceImpl:210` 直接调 `identityService.getIdentityProvider().deleteUser(realm, userId)`，`ManagerKeycloakIdentityProvider.deleteUser` 不做 assignee 清理，全仓库搜索 `security/` 下无任何 assignee 相关处理。
+
+**为什么该处理**：`ASSIGNEE_ID` 本身可空，`ON DELETE SET NULL` 在语义上完全可行且是常规做法；员工离职清理账号是常见运维动作，而告警通常被当作审计记录。
+
+**建议**：改为 `ON DELETE SET NULL`。
+
+```sql
+ALTER TABLE ${schemaName}.alarm DROP CONSTRAINT alarm_assignee_id_fkey;
+ALTER TABLE ${schemaName}.alarm
+  ADD CONSTRAINT alarm_assignee_id_fkey FOREIGN KEY (assignee_id)
+  REFERENCES PUBLIC.USER_ENTITY (ID) ON DELETE SET NULL;
+```
+
+---
+
+### 19.4 缺失的 realm 外键 —— 确认存在跨租户数据泄露路径（最高优先级）
+
+这一条实测出的机制与原先的猜测不同，且后果更明确。
+
+**第一步：既有外键会阻止 realm 删除。** 对一个仍有资产和规则集的 realm 调用 Keycloak 删除 API：
+
+```
+DELETE /admin/realms/tenantx -> HTTP 409
+{"error":"conflict","error_description":"Duplicate resource error"}
+```
+
+`ASSET.REALM`、`REALM_RULESET.REALM` 等外键挡住了删除，Keycloak 返回语义含混的 409。
+
+**第二步：Manager 自己的 `deleteRealm` 只清理一部分表。** 读 `ManagerKeycloakIdentityProvider.deleteRealm()`（`:1188`）：
+
+| 表 | `deleteRealm` 的处理 |
+|---|---|
+| `ASSET` | 有资产则**拒绝**删除 realm（`:1199`） |
+| `GATEWAY_CONNECTION` | ✅ 删除（`:1210`） |
+| `PROVISIONING_CONFIG` | ✅ 删除（`:1221`） |
+| `REALM_RULESET` | ✅ 删除（`:1232`） |
+| `DASHBOARD` | ❌ **不处理** |
+| `ALARM` | ❌ **不处理** |
+| `NOTIFICATION` | ❌ **不处理** |
+
+精确复现该方法的三条 JPQL 删除后：
+
+```
+survives the Manager's own deleteRealm cleanup
+dashboards | alarms | notifications | gw_conns | rulesets
+         1 |      1 |             1 |        0 |        0
+```
+
+即 `dashboard` / `alarm` / `notification` **既无外键保护、也无应用层清理**。
+
+**第三步：realm 名称复用使旧租户数据重现。** 删除 realm `tenantx`（租户 A）后以同名新建（租户 B）——realm UUID 已变，证明是全新 realm：
+
+```
+realm id changed (proves it is a NEW realm)
+id                                   | name
+fbf59b8b-99dc-4c50-a5a2-45ccef2df602 | tenantx
+```
+
+而租户 B 的查询看到了租户 A 的数据：
+
+```
+Tenant B now sees these ALARMS        | Tenant A confidential alarm | secret site detail
+Tenant B now sees these DASHBOARDS    | Tenant A private dashboard  | tenantA-user
+Tenant B now sees these NOTIFICATIONS | Tenant A notification       | {"subject": "Tenant A internal"}
+```
+
+**按表核对 API 层的真实可见性**（这决定了泄露的实际范围）：
+
+| 表 | 查询过滤条件 | 泄露情况 |
+|---|---|---|
+| `ALARM` | `AlarmService.getAlarms`（`:526`）仅 `where sa.realm = :realm`，告警本身无其他访问控制 | **完全泄露**给持有 `read:alarms` 的租户 B 用户 |
+| `NOTIFICATION` | `NotificationService`（`:638`/`:738`）仅 `AND n.realm IN ?` / `= ?` | **完全泄露** |
+| `DASHBOARD` | `DashboardStorageService`（`:98`、`:211`）按 realm + access 过滤；PRIVATE 要求 `owner_id = :userId` | **部分泄露**：PUBLIC/SHARED 可见，PRIVATE 因 owner 不匹配而隐藏 |
+
+实测 dashboard 三种访问级别：
+
+```
+display_name               | access | verdict
+A: PUBLIC dashboard        |      0 | VISIBLE to tenant B
+A: SHARED dashboard        |      1 | VISIBLE to tenant B
+Tenant A private dashboard |      2 | hidden
+```
+
+**风险定性**：这是**跨租户数据泄露**，而非单纯的存储浪费。触发条件是「删除 realm 后以同名重建」——在按客户名命名 realm 的 SaaS 部署里，客户流失后同名重新签约并不罕见；测试/演示环境反复建删同名 realm 更常见。
+
+**建议**（两者都做）：
+
+1. `deleteRealm` 补上 `Dashboard`、`SentAlarm`、`SentNotification` 的删除，与既有三张表一致；
+2. 给这三张表加上 realm 外键作为兜底（需先清理既有孤儿行）。只做 1 不做 2，直接在 Keycloak 控制台删 realm 仍会绕过清理。
+
+---
+
+### 19.5 JPA 与 DDL 列长度不一致 —— 运行期无害
+
+**实测**：`public.realm.name` 为 `varchar(255)`；成功在 Keycloak 建出 48 字符的 realm 名，并以该 realm 插入资产成功。
+
+**为何无害**：未配置任何 schema 校验（`PersistenceService` 只用到 `HBM2DDL_IMPORT_FILES_SQL_EXTRACTOR`，与 `hbm2ddl.auto=validate` 无关），schema 由 Flyway 独占管理，Hibernate 不在运行期校验 `@Column(length)`。
+
+**结论**：纯元数据误导（`length = 36` 显然是误抄了 UUID 长度）。改正可消除阅读歧义，无功能影响。
+
+---
+
+### 19.6 两处 ORDINAL 枚举 —— 确认无数据库层防护
+
+**实测**：两张表上均无 CHECK 约束（查询 `pg_constraint` 返回 0 行），且越界序数被静默接受：
+
+```
+display_name       | stored_ordinal      stored_level | message
+Bogus access level |             99                42 | bogus level
+```
+
+`DashboardAccess` 只有 3 个常量（0=PUBLIC、1=SHARED、2=PRIVATE），`SyslogLevel` 只有 3 个（0=INFO、1=WARN、2=ERROR），数据库却接受 99 和 42。
+
+**真正的风险不是越界值**（越界值在 Hibernate 读取时会抛异常，属吵闹失败），而是**枚举重排**：在中间插入或调换常量会把既有行静默重映射成「合法但错误」的值，全程无任何报错。`DASHBOARD.ACCESS` 尤其隐蔽——它连 `@Enumerated` 都没写，靠 JPA 默认值走 ORDINAL。
+
+注意 `SyslogLevel` 用序数有真实收益：`0 < 1 < 2` 单调递增，使 `LevelCategoryFilter` 能用 `level >= N` 做范围过滤。所以**不建议**改成 STRING。
+
+**建议**：给两个枚举加上「顺序即数据契约、不得重排」的注释，并补一个固定序数的断言测试；至少给 `DASHBOARD.ACCESS` 显式写出 `@Enumerated(EnumType.ORDINAL)`，让隐式契约变显式。
+
+---
+
+### 19.7 `GatewayConnection.port` 上界 65536
+
+代码层确认：`@Min(1) @Max(65536)`。TCP 端口有效范围是 1–65535，`65536` 会通过校验但不是合法端口。一字符修复，无数据影响。
+
+---
+
+### 19.8 增长型表缺二级索引 —— 实测 100–450 倍差距
+
+在真实数据量下测得（20,001 资产 / 500,001 通知 / 500,000 日志 / 50,002 告警；`asset` 10MB、`notification` 59MB、`syslog_event` 61MB、`alarm` 7MB）。查询形状取自各 service 的真实 SQL：
+
+| 查询（来源） | 无索引 | 有索引 | 提升 | 计划变化 |
+|---|---|---|---|---|
+| 告警按 realm+status（`AlarmService.getAlarms`） | 7.39 ms | **0.073 ms** | **101×** | Seq Scan → Index Scan |
+| 通知按 realm 取最新 50（`NotificationService`） | 48.68 ms | **0.108 ms** | **450×** | Parallel Seq Scan + top-N sort → Index Scan |
+| 日志按 category+level 取最新 100（日志页） | 39.69 ms | **0.126 ms** | **315×** | Parallel Seq Scan + top-N sort → Index Scan |
+| 资产按 realm（空 realm，最坏情况） | 7.38 ms | **0.031 ms** | **238×** | Seq Scan → Index Scan |
+
+**索引形状有讲究** —— 我最初给日志设计的 `(category, level, timestamp DESC)` 几乎无效（39.69 ms → 28.10 ms，仅 1.4×）：`level >= 1` 是**范围**谓词，索引在它之后无法再满足 `ORDER BY timestamp DESC`，计划退化为 Bitmap Heap Scan + top-N sort。把 `level` 移出索引、改为 `(category, timestamp DESC)` 后才真正生效（0.126 ms），`level` 作为 Filter 代价极小。
+
+验证可用的索引定义与成本：
+
+```sql
+-- 2.1 MB
+CREATE INDEX ON alarm (realm, status, created_on DESC);
+-- 15 MB
+CREATE INDEX ON notification (realm, sent_on DESC);
+-- 18 MB；注意不要把范围谓词列(level)放进来
+CREATE INDEX ON syslog_event (category, timestamp DESC);
+-- 152 kB
+CREATE INDEX ON asset (realm);
+```
+
+构建耗时在该数据量下为 13 ms – 1.6 s。
+
+**两点补充**：
+
+- 「无 category 过滤、只看最新日志」这一最常见入口仍是 Seq Scan（36 ms），需要再加一个 `syslog_event (timestamp DESC)`；
+- 绝对耗时看似不大（几十毫秒），但这是 50 万行的热缓存结果。Seq Scan 成本随行数**线性增长**而索引基本持平，且 `NOTIFICATION` 与 `SYSLOG_EVENT` **没有任何自动清理机制**（不像数据点表有 `drop_chunks` 保留策略），长期运行的实例会单调累积。
+
+**建议**：按上表加索引，并为这两张表安排归档或保留策略。
+
+---
+
+### 19.9 与 Keycloak 内部 schema 耦合 —— 确认成立，属设计约束
+
+实测在 Keycloak 26 上该耦合完整工作：
+
+- OpenRemote 依赖的 6 张 Keycloak 表全部存在于 `public`：`realm`、`user_entity`、`user_attribute`、`keycloak_role`、`client`、`realm_attribute`；
+- `@Subselect` 视图可正常读取（实测通过 `public.user_entity` 查到 Keycloak API 创建的用户）；
+- 跨 schema 外键**真实生效**：非法 `assignee_id` 被拒（`violates foreign key constraint "alarm_assignee_id_fkey"`），有资产的 realm 无法删除（409）。
+
+这不是缺陷，而是必须记录的架构约束：Manager 与 Keycloak **无法分库部署**，且 Keycloak 大版本升级若调整内部表结构会直接影响这些映射（Keycloak 的数据库 schema 不属其公开兼容契约）。
+
+---
+
+### 19.10 【新发现】自定义 `OR_DB_SCHEMA` 的全新部署会启动失败
+
+这条不是静态分析得出的，而是在测试「自定义 schema 部署」这一场景时暴露的。
+
+**原因**：`V20240722_01__Indexes.sql` 把 schema 名硬编码为 `openremote`：
+
+```sql
+CREATE index if not exists asset_datapoint_entity_id_attribute_name_timestamp_idx
+  on openremote.asset_datapoint (entity_id, attribute_name, timestamp DESC);
+CREATE index if not exists asset_predicted_datapoint_entity_id_attribute_name_timestamp_idx
+  on openremote.asset_predicted_datapoint (entity_id, attribute_name, timestamp DESC);
+```
+
+**实测**：在全新数据库上以 `OR_DB_SCHEMA=ormgr` 应用迁移链（此时 `openremote` schema 不存在）：
+
+```
+OK   V20191202_01__Schema.sql
+...
+OK   V20240711_01__UpdateGatewayConnection.sql
+FAIL V20240722_01__Indexes.sql  <-- ERROR:  schema "openremote" does not exist
+```
+
+**后果是启动失败，不只是少建索引**：Flyway 配置未设任何 `ignoreMigrationPatterns`（`PersistenceService.java:625-636` 只有 `cleanDisabled`、`validateMigrationNaming`、`baselineOnMigrate`、`outOfOrder`、`placeholders`），`flyway.migrate()` 抛出的异常经 `PersistenceService.start()` 向上传播，`Container.start()` 记录 `>>> Runtime container startup failed` 后重抛，`Main` 捕获并 `System.exit(1)`。
+
+**为何此前未被发现**：
+
+- 既有 `openremote` schema 的部署早已成功应用过 V20240722_01，随后 `V20251022_01` 用 `${schemaName}` 重建了这两个索引——**修复只对已通过该迁移的库有效**；
+- 全新 + 自定义 schema 的组合才会卡在 V20240722_01，而迁移链在此中止，永远到不了 V20251022_01。
+
+`OR_DB_SCHEMA` 是文档化的部署参数（`profile/deploy.yml:244`：`OR_DB_SCHEMA: ${OR_DB_SCHEMA:-openremote}`），因此该场景是可达的。
+
+**修复**：把这两行的 `openremote.` 换成 `${schemaName}.`。由于 V20240722_01 已在存量部署中标记为已应用，修改其内容会触发 Flyway 校验和失败，因此**不要改动该文件**，而应新增一个迁移脚本用 `${schemaName}` 创建这两个索引（`IF NOT EXISTS` 对存量部署天然幂等），或将 V20240722_01 的两条语句改为对 schema 存在性做容错。推荐前者。
+
+---
+
+## 20. 验证环境与方法
+
+第 19 节的结论基于以下环境实测，而非静态推断。
+
+**依赖栈**：项目自带的测试 profile，未做任何改动：
+
+```bash
+docker compose -f profile/dev-testing.yml -p orverify up -d --no-build
+# openremote/postgresql:develop-slim  +  openremote/keycloak:develop
+```
+
+- PostgreSQL 17.9，扩展 `timescaledb`、`timescaledb_toolkit`、`postgis`、`ltree`、`tablefunc` 均可用；
+- Keycloak 26 完成初始化并在 `public` schema 建好自身表，暴露于 `127.0.0.1:8081`。
+
+**schema 准备**：精确复现 `PersistenceService` 的 initSql 与 Flyway 行为：
+
+```sql
+ALTER DATABASE openremote SET search_path TO openremote, public, topology;
+CREATE EXTENSION IF NOT EXISTS timescaledb SCHEMA public cascade;
+CREATE EXTENSION IF NOT EXISTS timescaledb_toolkit SCHEMA public cascade;
+```
+
+随后按版本序应用全部 23 个 SQL 迁移，并把 `${schemaName}` 占位符替换为目标 schema。**23 个迁移在默认 schema 下全部成功应用**，证明迁移链本身在真实 Keycloak 库上自洽。
+
+**验证手段**：
+
+| 观察项 | 手段 |
+|---|---|
+| 19.2 / 19.3 / 19.4 / 19.6 | 真实 DDL 上的行为实验；用户与 realm 的增删走 **Keycloak 管理 REST API**（即生产同一路径），而非直接改表 |
+| 19.4 | 额外精确复现 `deleteRealm()` 的三条 JPQL 删除，再比对各表存活情况 |
+| 19.8 | 生成真实量级数据后 `EXPLAIN (ANALYZE, BUFFERS)`，加索引前后对比；索引形状经过两轮修正 |
+| 19.9 | 查 `information_schema` 确认 Keycloak 表存在，并以越界外键值和 realm 删除触发约束 |
+| 19.10 | 在全新数据库上以非默认 schema 名重跑整条迁移链 |
+| 19.1 / 19.5 / 19.7 | 代码层确认（19.1 另有「产品正常发布运行」作为运行期无害的反证） |
+
+**未能在本环境完成的验证**：启动完整 Manager 进程（`./gradlew :manager:run`）。构建先遇 Maven Central 429 限流，继而因沙箱无法访问 `jitpack.io`（`GradleFileEncrypt` 插件来源）而无法完成依赖解析。因此 19.1 的运行期结论依据的是注册机制分析加产品发布事实，而非本地启动日志；19.10 的启动失败结论依据的是迁移实测失败加 Flyway/Container/Main 的异常传播路径代码确认。其余各条均为直接实测。
 
 *文档生成于 2026-10-17，基于 `mydev` 分支 HEAD `8f8a5d2`。*
