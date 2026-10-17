@@ -26,12 +26,14 @@
    - [7.3 ASSET_RULESET](#73-asset_ruleset)
 8. [通知与告警域](#8-通知与告警域)
    - [8.1 NOTIFICATION](#81-notification)
+     - [8.1.1 保留策略（新增）](#811-保留策略新增)
    - [8.2 ALARM](#82-alarm)
    - [8.3 ALARM_ASSET_LINK](#83-alarm_asset_link)
 9. [仪表盘域](#9-仪表盘域)
 10. [网关域](#10-网关域)
 11. [置备域](#11-置备域)
 12. [系统日志域](#12-系统日志域)
+    - [12.1 保留策略（本来就有）](#121-保留策略本来就有)
 13. [Keycloak 只读视图映射](#13-keycloak-只读视图映射)
 14. [数据库函数](#14-数据库函数)
 15. [触发器](#15-触发器)
@@ -434,6 +436,37 @@ SQL 部分（先加可空列，再按可从库内推导的来源回填，镜像 
 
 Java 部分负责 SQL 做不到的事：`TARGET = 'USER'` 和 `SOURCE = 'CLIENT'` 的行需要**调 Keycloak API** 解析，之后应用 master 兜底，最后才加上 `NOT NULL` 约束。这是为什么该迁移必须拆成 `V20260715_1443`（SQL）+ `V20260715_1443_1`（Java）两步。
 
+#### 8.1.1 保留策略（新增）
+
+`NOTIFICATION` 原先**没有任何自动清理**：`NotificationService` 里没有任何定时任务，删除只能靠 REST 端点（`DELETE /notification`、`DELETE /notification/{id}`）手工触发。这张表随每次发送单调增长，且不像数据点表有 `drop_chunks` 保留策略。
+
+现已按本仓库既有的两个先例（`SyslogService` 与 `AssetDatapointService`）补上：
+
+| 项 | 值 |
+|---|---|
+| 配置项 | `OR_NOTIFICATION_MAX_AGE_DAYS` |
+| 默认 | `-1`，即**关闭** |
+| 调度 | 每日约 3:00，与 syslog / 数据点清理一致 |
+| 条件 | `delete from SentNotification n where n.sentOn < :cutoff` |
+| 支撑索引 | `NOTIFICATION_SENT_ON_IDX`（`V20261017_0300`） |
+
+**默认关闭是刻意的**。`SYSLOG_EVENT` 默认 5 天（日志是噪声，丢掉无妨），但通知是发送记录，部分部署会当审计数据长期保留。沿用数据点表「默认无限保留、由运维显式开启」的取舍，升级不会自行开始丢历史。
+
+实测（40 万行、跨 200 天、90 天保留）：
+
+```
+-- 首次启用，删掉窗口外的全部历史
+Delete on notification (actual time=455.948..455.949)
+  -> Index Scan using notification_sent_on_idx  rows=219610
+正确性：保留 180390 行，oldest_kept = cutoff = 2026-07-19（无更早行残留）
+
+-- 稳态，窗口每天前移一天
+Delete on notification (actual time=17.570..17.572)
+  -> Bitmap Heap Scan ... rows=1944            17.6 ms
+```
+
+清理是**单条 DELETE**（与 syslog、数据点清理一致，未分批）。因此在一个长期运行的实例上**首次**启用保留时，会一次性删除大量行；如果历史量很大，建议先手工按时间分段删到目标窗口附近，再开启该配置。
+
 ### 8.2 ALARM
 
 实体名 `SentAlarm`。
@@ -612,6 +645,22 @@ protected X509ProvisioningData data;   // 存 CA 证书等
 
 `SyslogEvent extends SharedEvent` —— 它既是 JPA 实体也是可通过 WebSocket 推送的事件，UI 的日志页因此能实时接收新日志而无需轮询。
 
+#### 12.1 保留策略（本来就有）
+
+与 `NOTIFICATION` 不同，这张表**一直有**自动清理，由 `SyslogService` 负责：
+
+| 项 | 值 |
+|---|---|
+| 配置项 | `OR_SYSLOG_MAX_AGE_DAYS` |
+| 默认 | **5 天**（`OR_SYSLOG_MAX_AGE_DAYS_DEFAULT`） |
+| 调度 | 每日约 3:00（`start()` 中 `truncatedTo(DAYS).plus(27, HOURS)`） |
+| 条件 | `delete from SyslogEvent e where e.timestamp <= :date` |
+| 关闭方式 | 设为 `0` 或负数（`config.getStoredMaxAgeMinutes() > 0` 才排程） |
+
+内部以分钟存储（`maxAgeDays * 24 * 60`）。另有 `OR_SYSLOG_LOG_LEVEL`（默认 `INFO`）控制入库级别，以及 `SyslogResourceImpl` 暴露的清空接口（`delete from SyslogEvent e`，无条件全删）。
+
+> 本文早期版本称这张表没有清理机制，属错误，已更正。
+
 `LEVEL` 用 `@Enumerated(EnumType.ORDINAL)` 存序数（而 `CATEGORY` 用 STRING）。与 `DASHBOARD.ACCESS` 同样的约束：**`SyslogLevel` 常量顺序是数据契约**。好处是序数天然单调递增（INFO=0 < WARN=1 < ERROR=2），可以直接写 `WHERE level >= 1` 取"警告及以上"（`LevelCategoryFilter` 正是依赖这一点做级别过滤）。
 
 ---
@@ -759,6 +808,7 @@ END IF;
 | `SYSLOG_EVENT_CATEGORY_TIMESTAMP_IDX` | `SYSLOG_EVENT` | `(CATEGORY, TIMESTAMP DESC)` | `V20261017_0225` |
 | `SYSLOG_EVENT_TIMESTAMP_IDX` | `SYSLOG_EVENT` | `(TIMESTAMP DESC)` | `V20261017_0225` |
 | `ASSET_REALM_IDX` | `ASSET` | `(REALM)` | `V20261017_0225` |
+| `NOTIFICATION_SENT_ON_IDX` | `NOTIFICATION` | `(SENT_ON)` | `V20261017_0300`（服务于每日清理） |
 
 GiST 索引是 ltree 子树查询（`<@`、`@>`）走索引的前提，直接决定 `AssetQuery.recursive` 的性能。
 
@@ -793,12 +843,12 @@ TimescaleDB 另为 hypertable 的每个 chunk 维护时间维索引。
 |---|---|
 | `ASSET.ATTRIBUTES` 无 GIN 索引 | 按属性值过滤资产（`AssetQuery.attributes`）走顺序扫描 |
 | `ASSET.REALM` 无索引 | 多租户部署中按 realm 列资产依赖顺序扫描（`PARENT_ID` 索引对根资产查询帮助有限） |
-| `NOTIFICATION` 无二级索引 | 按 realm / 目标 / 时间查历史通知走全表扫描；该表随时间单调增长 |
+| `NOTIFICATION` 无二级索引 | 按 realm / 目标 / 时间查历史通知走全表扫描 |
 | `SYSLOG_EVENT` 无二级索引 | 同上，日志页按级别/分类/时间过滤走全表扫描 |
 | `ALARM` 无二级索引 | 按 realm / 状态 / assignee 查告警走全表扫描 |
 | `ALARM_ASSET_LINK` 的 `SENTALARM_ID` 不是主键前缀 | "某告警关联了哪些资产"无法走索引 |
 
-这些表都是写入持续增长、UI 频繁过滤查询的 —— 在数据量上来后是优化的首选位置。
+这些表都是写入持续增长、UI 频繁过滤查询的 —— 在数据量上来后是优化的首选位置。上述缺口已由 `V20261017_0225` 与 `V20261017_0300` 补齐，见 §19.8 与 §8.1.1。
 
 ---
 
@@ -873,6 +923,7 @@ TimescaleDB 另为 hypertable 的每个 chunk 维护时间维索引。
 | `V20261017_0215` | `AlarmAssigneeSetNull` | DDL | `ALARM.ASSIGNEE_ID` 外键改为 `ON DELETE SET NULL`（修复 §19.3） |
 | `V20261017_0220` | `RealmScopedForeignKeys` | DDL | `DASHBOARD`/`ALARM`/`NOTIFICATION`/`GATEWAY_CONNECTION.LOCAL_REALM` 补 realm 外键，`NOT VALID`（修复 §19.4） |
 | `V20261017_0225` | `GrowthTableIndexes` | 索引 | 增长型表的二级索引（修复 §19.8） |
+| `V20261017_0300` | `NotificationSentOnIndex` | 索引 | `NOTIFICATION (SENT_ON)`，服务于新增的通知清理 |
 
 ### Java 迁移（`manager/setup/database/`）
 
@@ -1167,7 +1218,9 @@ CREATE INDEX ON asset (realm);
 **两点补充**：
 
 - 「无 category 过滤、只看最新日志」这一最常见入口仍是 Seq Scan（36 ms），需要再加一个 `syslog_event (timestamp DESC)`；
-- 绝对耗时看似不大（几十毫秒），但这是 50 万行的热缓存结果。Seq Scan 成本随行数**线性增长**而索引基本持平，且 `NOTIFICATION` 与 `SYSLOG_EVENT` **没有任何自动清理机制**（不像数据点表有 `drop_chunks` 保留策略），长期运行的实例会单调累积。
+- 绝对耗时看似不大（几十毫秒），但这是 50 万行的热缓存结果。Seq Scan 成本随行数**线性增长**而索引基本持平。
+
+> **更正**：本文此前称 `NOTIFICATION` 与 `SYSLOG_EVENT`「没有任何自动清理机制」。对 `SYSLOG_EVENT` 而言这是错的 —— `SyslogService` 一直有按天清理（见 §12.1）。只有 `NOTIFICATION` 原先确实没有，现已补上（见 §8.1.1）。
 
 **已修复** —— `V20261017_0225__GrowthTableIndexes.sql` 按上述形状建立索引（含补上的 `SYSLOG_EVENT (TIMESTAMP DESC)`）。在装载数据的库上确认执行计划全部命中新索引：
 
@@ -1178,7 +1231,7 @@ syslog category newest     -> Index Scan using syslog_event_category_timestamp_i
 syslog no category filter  -> Index Scan using syslog_event_timestamp_idx            0.072 ms
 ```
 
-`NOTIFICATION` 与 `SYSLOG_EVENT` 的归档/保留策略**仍未解决**——索引只改善读取，不阻止表无限增长。
+保留策略方面：`SYSLOG_EVENT` 本来就有（§12.1），`NOTIFICATION` 的已随本次一并补上（§8.1.1）。
 
 ---
 
@@ -1309,8 +1362,11 @@ CREATE EXTENSION IF NOT EXISTS timescaledb_toolkit SCHEMA public cascade;
 | `manager/.../database/V20261017_0220__RealmScopedForeignKeys.sql` | 新增 | §19.4 |
 | `manager/.../database/V20261017_0225__GrowthTableIndexes.sql` | 新增 | §19.8 |
 | `manager/.../database/V20240722_01__Indexes.sql` | **删除** | §19.10 |
+| `manager/.../database/V20261017_0300__NotificationSentOnIndex.sql` | 新增 | §8.1.1 |
 | `manager/.../security/ManagerKeycloakIdentityProvider.java` | `deleteRealm()` 补三张表的清理 | §19.4 |
+| `manager/.../notification/NotificationService.java` | 新增 `OR_NOTIFICATION_MAX_AGE_DAYS` 与每日清理 | §8.1.1 |
 | `container/.../persistence/PersistenceService.java` | Flyway 加 `ignoreMigrationPatterns("versioned:missing")` | §19.10 |
+| `profile/deploy.yml` | 补 `OR_NOTIFICATION_MAX_AGE_DAYS` 与 `OR_SYSLOG_MAX_AGE_DAYS` 的注释说明 | §8.1.1、§12.1 |
 
 未改动的观察项：19.1、19.2（结论撤回）、19.5、19.6、19.7、19.9。
 
@@ -1323,6 +1379,7 @@ CREATE EXTENSION IF NOT EXISTS timescaledb_toolkit SCHEMA public cascade;
 | 全新部署，默认 schema `openremote` | `Successfully applied 26 migrations`，随后 `validate` 通过 |
 | 全新部署，自定义 schema `ormgr` | `Successfully applied 25 migrations`（修复前卡在 `V20240722_01`） |
 | 存量部署，默认 schema | `Successfully validated 27 migrations` |
+| 追加保留索引后再次全量迁移 | `Successfully applied 26 migrations ... now at version v20261017.0300`，`validate` 通过 |
 
 行为层面逐条复跑了修复前失败的场景（删用户、删 realm、realm 名复用、各查询执行计划），结果见 §19.3 / §19.4 / §19.8。新建的约束与索引经 `pg_constraint` / `pg_stat_user_indexes` 核对到位，realm 外键的 `convalidated = f` 确认为 `NOT VALID`。
 
@@ -1332,9 +1389,10 @@ CREATE EXTENSION IF NOT EXISTS timescaledb_toolkit SCHEMA public cascade;
 
 - `ManagerKeycloakIdentityProvider.deleteRealm()` 新增的三段 JPQL 删除，其字段名（`Dashboard.realm`、`SentAlarm.realm`、`SentNotification.realm`）与导入均已逐一核对，代码形态与同方法内既有三段完全一致，但**未经编译**；三段删除等价的 SQL 已在真实 schema 上验证（包括删除 `ALARM` 行会通过 `ALARM_ASSET_LINK` 的级联带走关联行）。
 - `PersistenceService` 的 `ignoreMigrationPatterns("versioned:missing")` 调用签名已用 `javap` 对 `flyway-core 13.10.0` 核对存在且返回 `FluentConfiguration`，但**未经编译**。
+- `NotificationService` 的清理逻辑：`getInteger` 静态导入、`container.getScheduledExecutor()`、`SentNotification.sentOn` 与 `Instant` 参数的用法均对照同文件内既有代码（`n.sentOn >= ?` 等）与 `SyslogService`/`AssetDatapointService` 的调度写法核对，等价 SQL 已在真实 schema 上验证正确性与执行计划，但**未经编译**，定时任务也**未在运行中的 Manager 上实际触发过**。
 - `spotless` 格式化未运行。
 
-合并前应至少执行 `./gradlew :manager:compileJava :container:compileJava` 与 `./gradlew spotlessApply`，并跑一遍 realm/user 删除相关的 Spock 集成测试。
+合并前应至少执行 `./gradlew :manager:compileJava :container:compileJava` 与 `./gradlew spotlessApply`，跑一遍 realm/user 删除相关的 Spock 集成测试，并为通知清理补一个 Spock 规格（`TimerService` 支持伪时钟，可直接做时间旅行验证清理窗口）。
 
 ---
 

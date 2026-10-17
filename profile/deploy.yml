@@ -369,6 +369,15 @@ services:
       # Configure the limit of data points that can be exported to CSV. Defaults to 1 million data points.
       # OR_DATA_POINTS_EXPORT_LIMIT: 10000000
 
+      # Configure the max age in days for sent notifications stored in the database; they are purged
+      # daily. Purging is disabled by default, so the NOTIFICATION table grows without bound unless
+      # this is set.
+      # OR_NOTIFICATION_MAX_AGE_DAYS: 90
+
+      # Configure the max age in days for syslog events stored in the database; they are purged
+      # daily. Defaults to 5; set to 0 or less to disable purging.
+      # OR_SYSLOG_MAX_AGE_DAYS: 5
+
       # App id for the API of OpenWeather: https://openweathermap.org
       # OR_OPEN_WEATHER_API_APP_ID
 

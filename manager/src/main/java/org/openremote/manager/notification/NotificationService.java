@@ -23,13 +23,18 @@ import static java.util.Map.entry;
 import static org.openremote.manager.notification.NotificationProcessingException.Reason.*;
 import static org.openremote.model.notification.Notification.HEADER_SOURCE;
 import static org.openremote.model.notification.Notification.Source.*;
+import static org.openremote.model.util.MapAccess.getInteger;
 
 import jakarta.persistence.Query;
 import jakarta.persistence.TypedQuery;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -65,8 +70,20 @@ import org.openremote.model.util.TimeUtil;
 public class NotificationService extends RouteBuilder implements ContainerService {
 
   public static final String NOTIFICATION_QUEUE = "direct://NotificationQueue";
+
+  /**
+   * Age in days past {@link SentNotification#getSentOn} after which a notification is purged. Zero
+   * or less disables purging, which is the default, so an upgrade never starts discarding history
+   * on its own. Mirrors {@link
+   * org.openremote.manager.datapoint.AssetDatapointService#OR_DATA_POINTS_MAX_AGE_WEEKS}.
+   */
+  public static final String OR_NOTIFICATION_MAX_AGE_DAYS = "OR_NOTIFICATION_MAX_AGE_DAYS";
+
   private static final Logger LOG = Logger.getLogger(NotificationService.class.getName());
   protected TimerService timerService;
+  protected ScheduledExecutorService scheduledExecutorService;
+  protected ScheduledFuture<?> purgeFuture;
+  protected int maxAgeDays = -1;
   protected PersistenceService persistenceService;
   protected AssetStorageService assetStorageService;
   protected ManagerIdentityService identityService;
@@ -83,6 +100,7 @@ public class NotificationService extends RouteBuilder implements ContainerServic
   @Override
   public void init(Container container) throws Exception {
     this.timerService = container.getService(TimerService.class);
+    this.scheduledExecutorService = container.getScheduledExecutor();
     this.persistenceService = container.getService(PersistenceService.class);
     this.assetStorageService = container.getService(AssetStorageService.class);
     this.clientEventService = container.getService(ClientEventService.class);
@@ -121,13 +139,64 @@ public class NotificationService extends RouteBuilder implements ContainerServic
 
           return true;
         });
+
+    maxAgeDays = getInteger(container.getConfig(), OR_NOTIFICATION_MAX_AGE_DAYS, -1);
+
+    if (maxAgeDays <= 0) {
+      LOG.info("Notification purge disabled");
+    } else {
+      LOG.info("Notification purge retention = " + maxAgeDays + " days");
+    }
   }
 
   @Override
-  public void start(Container container) throws Exception {}
+  public void start(Container container) throws Exception {
+    if (maxAgeDays > 0) {
+      // Schedule purge at approximately 3AM daily, as the syslog and data point purges do
+      long initialDelay =
+          ChronoUnit.MILLIS.between(
+              timerService.getNow(), timerService.getNow().truncatedTo(DAYS).plus(27, HOURS));
+
+      purgeFuture =
+          scheduledExecutorService.scheduleAtFixedRate(
+              this::purgeNotifications,
+              initialDelay,
+              Duration.ofDays(1).toMillis(),
+              TimeUnit.MILLISECONDS);
+    }
+  }
 
   @Override
-  public void stop(Container container) throws Exception {}
+  public void stop(Container container) throws Exception {
+    if (purgeFuture != null) {
+      purgeFuture.cancel(true);
+      purgeFuture = null;
+    }
+  }
+
+  /**
+   * Deletes notifications sent longer ago than {@link #OR_NOTIFICATION_MAX_AGE_DAYS}. Issued as a
+   * single statement, matching the syslog and data point purges; the first run after enabling
+   * retention on a long-lived instance may therefore remove a large number of rows at once.
+   */
+  protected void purgeNotifications() {
+    try {
+      Instant cutoff = timerService.getNow().truncatedTo(DAYS).minus(maxAgeDays, DAYS);
+
+      int deleted =
+          persistenceService.doReturningTransaction(
+              em ->
+                  em.createQuery("delete from SentNotification n where n.sentOn < :cutoff")
+                      .setParameter("cutoff", cutoff)
+                      .executeUpdate());
+
+      if (deleted > 0) {
+        LOG.info("Purged " + deleted + " notifications sent before " + cutoff);
+      }
+    } catch (Throwable e) {
+      LOG.log(Level.WARNING, "Failed to purge notifications", e);
+    }
+  }
 
   @Override
   public void configure() throws Exception {
