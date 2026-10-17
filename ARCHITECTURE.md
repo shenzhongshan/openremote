@@ -1,6 +1,7 @@
 # OpenRemote 技术架构与功能模块分析
 
 > 本文基于仓库 `openremote/core` 分支 `mydev`（HEAD `72aff0f`）的源码静态分析整理，所有结论均可在代码中追溯到具体文件。
+> 数据库表与字段的逐列说明见配套文档 [`DATABASE_SCHEMA.md`](./DATABASE_SCHEMA.md)。
 
 ---
 
@@ -415,7 +416,7 @@ IO 抽象层（`agent/protocol/io`）：`IOClient`/`IOServer` 接口 + `Abstract
 | 作用域 | 实体 | 表 |
 |---|---|---|
 | 全局 | `GlobalRuleset` | `GLOBAL_RULESET` |
-| 租户 | `RealmRuleset` | `TENANT_RULESET`（`V20220523_03__RenameTenantRuleset.sql` 后保留表名） |
+| 租户 | `RealmRuleset` | `REALM_RULESET`（`V20220523_03__RenameTenantRuleset.sql` 把 `TENANT_RULESET` 重命名而来） |
 | 资产 | `AssetRuleset` | `ASSET_RULESET` |
 
 四种语言（`Ruleset.Lang`），默认 `GROOVY`：
@@ -642,7 +643,7 @@ OpenRemote 支持**分层部署**：边缘实例作为"网关"连接到中心实
 | `ASSET` | `ID varchar(22)`（friendly-id，Base62 UUID）、`ATTRIBUTES jsonb`、`PATH ltree`（层级路径）、`REALM`、`TYPE varchar(500)`、`ACCESS_PUBLIC_READ`、乐观锁 `VERSION`，`check (ID != PARENT_ID)` |
 | `ASSET_DATAPOINT` | 主键 `(TIMESTAMP, ENTITY_ID, ATTRIBUTE_NAME)`，`VALUE jsonb` |
 | `ASSET_PREDICTED_DATAPOINT` | 预测时序 |
-| `GLOBAL_RULESET` / `ASSET_RULESET` / `TENANT_RULESET` | 规则集，`RULES text` + `RULES_LANG` + `META jsonb` |
+| `GLOBAL_RULESET` / `ASSET_RULESET` / `REALM_RULESET` | 规则集，`RULES text` + `RULES_LANG` + `META jsonb`（`REALM_RULESET` 原名 `TENANT_RULESET`，由 `V20220523_03` 重命名） |
 | `USER_ASSET_LINK` | 受限用户 ↔ 资产关联 |
 | `NOTIFICATION` | 发送记录（`V20260715_1443__AddNotificationRealm.sql` 加 realm，`V20260715_1443_1__BackfillNotificationRealmUsers` 回填） |
 | `SYSLOG_EVENT` | 平台日志 |
